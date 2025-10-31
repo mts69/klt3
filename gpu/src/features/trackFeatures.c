@@ -1315,10 +1315,22 @@ void KLTTrackFeatures(
 	_KLTComputePyramid(floatimg2, pyramid2, tc->pyramid_sigma_fact);
 	pyramid2_gradx = _KLTCreatePyramid(ncols, nrows, (int) subsampling, tc->nPyramidLevels);
 	pyramid2_grady = _KLTCreatePyramid(ncols, nrows, (int) subsampling, tc->nPyramidLevels);
-	for (i = 0 ; i < tc->nPyramidLevels ; i++)
-		_KLTComputeGradients(pyramid2->img[i], tc->grad_sigma, 
-		pyramid2_gradx->img[i],
-		pyramid2_grady->img[i]);
+	
+  
+  // for (i = 0 ; i < tc->nPyramidLevels ; i++)
+	// 	_KLTComputeGradients(pyramid2->img[i], tc->grad_sigma, 
+	// 	pyramid2_gradx->img[i],
+	// 	pyramid2_grady->img[i]);
+
+
+  // Compute gradients for all pyramid levels at once
+  _KLTBulkComputeGradients(
+      pyramid1->img,               // array of input pyramid images
+      tc->grad_sigma,              // gradient smoothing sigma
+      pyramid1_gradx->img,         // array of gradient-X outputs
+      pyramid1_grady->img,         // array of gradient-Y outputs
+      tc->nPyramidLevels           // total number of pyramid levels
+  );
 
 	/* Write internal images */
 	if (tc->writeInternalImages)  {

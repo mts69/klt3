@@ -1084,6 +1084,9 @@ extern "C" void _KLTBulkComputeGradients(
   _KLT_FloatImage *grady_array,
   int count)
 {
+  if (!isfinite(sigma) || sigma < 0.01f)
+    sigma = 1.0f;
+
   if (!img_array || !gradx_array || !grady_array || count <= 0) return;
   
   // Single image case
