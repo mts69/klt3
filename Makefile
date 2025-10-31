@@ -18,7 +18,7 @@ GPU_INCLUDE_DIR   = gpu/include
 EXAMPLES_DIR  = examples
 BUILD_DIR     = build
 TOOLS_DIR     = tools
-DATA_DIR      = data/pitch/frames
+DATA_DIR      = /content/frames
 OUTPUT_DIR    = output
 PROFILE_DIR   = profiles
 
@@ -35,7 +35,7 @@ MAX_FRAMES     = 99999999
 ######################################################################
 # Flags
 # CUDA_ARCH: 75=T4(Turing), 86=RTX3080(Ampere), 89=RTX4090(Ada)
-CUDA_ARCH ?= 86             
+CUDA_ARCH ?= 75           
 ARCH       = sm_$(CUDA_ARCH)
 FLAG1        = -DNDEBUG
 CPU_CFLAGS   = $(FLAG1) -I$(CPU_INCLUDE_DIR)
