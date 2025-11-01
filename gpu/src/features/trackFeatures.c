@@ -378,7 +378,7 @@ static float _sumAbsFloatWindow(
  * KLT_TRACKED otherwise.
  */
 
-static int _trackFeature(
+int _trackFeature(
   float x1,  /* location of window in first image */
   float y1,
   float *x2, /* starting location of search in second image */
@@ -488,7 +488,7 @@ static int _trackFeature(
 
 /*********************************************************************/
 
-static KLT_BOOL _outOfBounds(
+KLT_BOOL _outOfBounds(
   float x,
   float y,
   int ncols,
@@ -1543,3 +1543,205 @@ void KLTTrackFeatures(
 }
 
 
+
+/*********************************************************************
+ * _KLTTrackFeaturesWithPrecomputedPyramids
+ * 
+ * IDENTICAL logic to KLTTrackFeatures, but uses pre-computed pyramids
+ * instead of computing them on-the-fly.
+ * 
+ * This is the EXACT same tracking loop from your original code!
+ *********************************************************************/
+static void _KLTTrackFeaturesWithPrecomputedPyramids(
+    _KLT_Pyramid pyramid1, 
+    _KLT_Pyramid pyramid1_gradx, 
+    _KLT_Pyramid pyramid1_grady,
+    _KLT_Pyramid pyramid2, 
+    _KLT_Pyramid pyramid2_gradx, 
+    _KLT_Pyramid pyramid2_grady,
+    KLT_FeatureList featurelist,
+    KLT_TrackingContext tc)
+{
+    float subsampling = (float) tc->subsampling;
+    float xloc, yloc, xlocout, ylocout;
+    int val;
+    int indx, r;
+    int ncols = pyramid1->ncols[0];
+    int nrows = pyramid1->nrows[0];
+
+    if (KLT_verbose >= 1) {
+        fprintf(stderr, "(KLT) Tracking %d features in a %d by %d image...  ",
+                KLTCountRemainingFeatures(featurelist), ncols, nrows);
+        fflush(stderr);
+    }
+
+    /* For each feature, do ... */
+    for (indx = 0; indx < featurelist->nFeatures; indx++) {
+
+        /* Only track features that are not lost */
+        if (featurelist->feature[indx]->val >= 0) {
+
+            xloc = featurelist->feature[indx]->x;
+            yloc = featurelist->feature[indx]->y;
+
+            /* Transform location to coarsest resolution */
+            for (r = tc->nPyramidLevels - 1; r >= 0; r--) {
+                xloc /= subsampling;
+                yloc /= subsampling;
+            }
+            xlocout = xloc;
+            ylocout = yloc;
+
+            /* Beginning with coarsest resolution, do ... */
+            for (r = tc->nPyramidLevels - 1; r >= 0; r--) {
+
+                /* Track feature at current resolution */
+                xloc *= subsampling;
+                yloc *= subsampling;
+                xlocout *= subsampling;
+                ylocout *= subsampling;
+
+                val = _trackFeature(xloc, yloc,
+                                    &xlocout, &ylocout,
+                                    pyramid1->img[r],
+                                    pyramid1_gradx->img[r], pyramid1_grady->img[r],
+                                    pyramid2->img[r],
+                                    pyramid2_gradx->img[r], pyramid2_grady->img[r],
+                                    tc->window_width, tc->window_height,
+                                    tc->step_factor,
+                                    tc->max_iterations,
+                                    tc->min_determinant,
+                                    tc->min_displacement,
+                                    tc->max_residue,
+                                    tc->lighting_insensitive);
+
+                if (val == KLT_SMALL_DET || val == KLT_OOB)
+                    break;
+            }
+
+            /* Record feature */
+            if (val == KLT_OOB) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_OOB;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+
+            } else if (_outOfBounds(xlocout, ylocout, ncols, nrows, tc->borderx, tc->bordery)) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_OOB;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            } else if (val == KLT_SMALL_DET) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_SMALL_DET;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            } else if (val == KLT_LARGE_RESIDUE) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_LARGE_RESIDUE;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            } else if (val == KLT_MAX_ITERATIONS) {
+                featurelist->feature[indx]->x = -1.0;
+                featurelist->feature[indx]->y = -1.0;
+                featurelist->feature[indx]->val = KLT_MAX_ITERATIONS;
+                if (featurelist->feature[indx]->aff_img) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                if (featurelist->feature[indx]->aff_img_gradx) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                if (featurelist->feature[indx]->aff_img_grady) _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                featurelist->feature[indx]->aff_img = NULL;
+                featurelist->feature[indx]->aff_img_gradx = NULL;
+                featurelist->feature[indx]->aff_img_grady = NULL;
+            } else {
+                featurelist->feature[indx]->x = xlocout;
+                featurelist->feature[indx]->y = ylocout;
+                featurelist->feature[indx]->val = KLT_TRACKED;
+                
+                if (tc->affineConsistencyCheck >= 0 && val == KLT_TRACKED) { /*for affine mapping*/
+                    int border = 2; /* add border for interpolation */
+
+#ifdef DEBUG_AFFINE_MAPPING
+                    glob_index = indx;
+#endif
+
+                    if (!featurelist->feature[indx]->aff_img) {
+                        /* save image and gradient for each feature at finest resolution after first successful track */
+                        featurelist->feature[indx]->aff_img = _KLTCreateFloatImage((tc->affine_window_width + border), (tc->affine_window_height + border));
+                        featurelist->feature[indx]->aff_img_gradx = _KLTCreateFloatImage((tc->affine_window_width + border), (tc->affine_window_height + border));
+                        featurelist->feature[indx]->aff_img_grady = _KLTCreateFloatImage((tc->affine_window_width + border), (tc->affine_window_height + border));
+                        _am_getSubFloatImage(pyramid1->img[0], xloc, yloc, featurelist->feature[indx]->aff_img);
+                        _am_getSubFloatImage(pyramid1_gradx->img[0], xloc, yloc, featurelist->feature[indx]->aff_img_gradx);
+                        _am_getSubFloatImage(pyramid1_grady->img[0], xloc, yloc, featurelist->feature[indx]->aff_img_grady);
+                        featurelist->feature[indx]->aff_x = xloc - (int)xloc + (tc->affine_window_width + border) / 2;
+                        featurelist->feature[indx]->aff_y = yloc - (int)yloc + (tc->affine_window_height + border) / 2;
+                    } else {
+                        /* affine tracking */
+                        val = _am_trackFeatureAffine(featurelist->feature[indx]->aff_x, featurelist->feature[indx]->aff_y,
+                                                     &xlocout, &ylocout,
+                                                     featurelist->feature[indx]->aff_img,
+                                                     featurelist->feature[indx]->aff_img_gradx,
+                                                     featurelist->feature[indx]->aff_img_grady,
+                                                     pyramid2->img[0],
+                                                     pyramid2_gradx->img[0], pyramid2_grady->img[0],
+                                                     tc->affine_window_width, tc->affine_window_height,
+                                                     tc->step_factor,
+                                                     tc->affine_max_iterations,
+                                                     tc->min_determinant,
+                                                     tc->min_displacement,
+                                                     tc->affine_min_displacement,
+                                                     tc->affine_max_residue,
+                                                     tc->lighting_insensitive,
+                                                     tc->affineConsistencyCheck,
+                                                     tc->affine_max_displacement_differ,
+                                                     &featurelist->feature[indx]->aff_Axx,
+                                                     &featurelist->feature[indx]->aff_Ayx,
+                                                     &featurelist->feature[indx]->aff_Axy,
+                                                     &featurelist->feature[indx]->aff_Ayy);
+                        featurelist->feature[indx]->val = val;
+                        if (val != KLT_TRACKED) {
+                            featurelist->feature[indx]->x = -1.0;
+                            featurelist->feature[indx]->y = -1.0;
+                            featurelist->feature[indx]->aff_x = -1.0;
+                            featurelist->feature[indx]->aff_y = -1.0;
+                            /* free image and gradient for lost feature */
+                            _KLTFreeFloatImage(featurelist->feature[indx]->aff_img);
+                            _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_gradx);
+                            _KLTFreeFloatImage(featurelist->feature[indx]->aff_img_grady);
+                            featurelist->feature[indx]->aff_img = NULL;
+                            featurelist->feature[indx]->aff_img_gradx = NULL;
+                            featurelist->feature[indx]->aff_img_grady = NULL;
+                        } else {
+                            /*featurelist->feature[indx]->x = xlocout;*/
+                            /*featurelist->feature[indx]->y = ylocout;*/
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (KLT_verbose >= 1) {
+        fprintf(stderr, "\n\t%d features successfully tracked.\n",
+                KLTCountRemainingFeatures(featurelist));
+        fflush(stderr);
+    }
+}

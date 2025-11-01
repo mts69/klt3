@@ -7,6 +7,7 @@
  
  #include "klt.h"
  #include "klt_util.h"
+ #include "pyramid.h"
  
  #ifdef __cplusplus
  extern "C" {
@@ -40,6 +41,17 @@ void _KLTComputeSmoothedImage(
   _KLT_FloatImage img,
   float sigma,
   _KLT_FloatImage smooth);
+
+void _KLTBulkBuildPyramidsWithGradientsULTRA(
+    KLT_PixelType **raw_images,        // [batch_size] input images
+    _KLT_Pyramid *pyramids_out,        // [batch_size] smoothed pyramids
+    _KLT_Pyramid *pyramids_gradx_out,  // [batch_size] gradient-X pyramids  
+    _KLT_Pyramid *pyramids_grady_out,  // [batch_size] gradient-Y pyramids
+    int batch_size,
+    KLT_TrackingContext tc);
+
+    
+void _KLTCleanupUltraBuffers();
 
 // Timing functions (DISABLED for performance)
 // void _KLT_printConvolveTiming();
