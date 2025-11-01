@@ -217,7 +217,7 @@ void _KLTComputePyramid(
  *
  * This avoids two separate GPU kernel launches for each image pyramid.
  *********************************************************************/
-extern "C" void _KLTComputeDualPyramidBulk(
+void _KLTComputeDualPyramidBulk(
   _KLT_FloatImage img1,
   _KLT_FloatImage img2,
   _KLT_Pyramid pyramid1,
