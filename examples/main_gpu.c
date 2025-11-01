@@ -10,6 +10,13 @@ saved to a text file; each feature list is also written to a PPM file.
 #include "pnmio.h"
 #include "klt.h"
 
+
+
+#ifndef
+#define ULTRA_BATCH_SIZE 16
+#endif
+
+
 /* Define data directory - can be overridden at compile time */
 #ifndef DATA_DIR
 #define DATA_DIR "data/"
@@ -75,6 +82,41 @@ int main()
   KLTStoreFeatureList(fl, ft, 0);
   //sprintf(fnameout, "%sfeat0.ppm", OUTPUT_DIR);
   //KLTWriteFeatureListToPPM(fl, img1, ncols, nrows, fnameout);
+
+
+
+
+  KLT_PixelType ** frame_buffer = malloc(ULTRA_BATCH_SIZE * sizeof(KLT_PixelType*));
+  for (int i = 0; i < ULTRA_BATCH_SIZE; i++) 
+  {
+    frame_buffer[i] = malloc(ncols * nrows * sizeof(KLT_PixelType));
+  }
+
+  KLT_PixelType **frame_buffer = malloc(ULTRA_BATCH_SIZE * sizeof(KLT_PixelType*));
+  for (int i = 0; i < ULTRA_BATCH_SIZE; i++) 
+  {
+      frame_buffer[i] = malloc(ncols * nrows * sizeof(KLT_PixelType));
+  }
+    
+  // Allocate pyramid arrays
+  _KLT_Pyramid *pyramids = malloc(ULTRA_BATCH_SIZE * sizeof(_KLT_Pyramid));
+  _KLT_Pyramid *pyramids_gradx = malloc(ULTRA_BATCH_SIZE * sizeof(_KLT_Pyramid));
+  _KLT_Pyramid *pyramids_grady = malloc(ULTRA_BATCH_SIZE * sizeof(_KLT_Pyramid));
+  
+  for (int i = 0; i < ULTRA_BATCH_SIZE; i++) 
+  {
+    pyramids[i] = _KLTCreatePyramid(ncols, nrows, tc->subsampling, tc->nPyramidLevels);
+    pyramids_gradx[i] = _KLTCreatePyramid(ncols, nrows, tc->subsampling, tc->nPyramidLevels);
+    pyramids_grady[i] = _KLTCreatePyramid(ncols, nrows, tc->subsampling, tc->nPyramidLevels);
+  }
+     
+
+
+
+
+
+
+
   
   //printf("🔄 GPU Time: Tracking features through %d frames...\n", nFrames-1);
   for (i = 1 ; i < nFrames && i < MAX_FRAMES ; i++)  {

@@ -23,6 +23,7 @@
  #include "error.h"
  #include "convolve.h"
  #include "klt_util.h"
+ #include "pyramid.h"
  
  #define MAX_KERNEL_WIDTH 71
  #define WARP_SIZE 32
@@ -1233,3 +1234,570 @@ void _KLTCleanupGPU()
   
   _KLTCleanupBulkGPU();  // Clean up bulk buffers
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*********************************************************************
+ * _KLTBulkBuildPyramidsWithGradientsULTRA
+ * 
+ * 🚀 THE NUCLEAR OPTION - Maximum parallelism across:
+ *   - Frames (batch_size)
+ *   - Pyramid levels (nPyramidLevels)
+ *   - Operations (smooth, gradX, gradY)
+ * 
+ * PERFORMANCE TARGET: 4-6× faster than sequential
+ * 
+ * Key Optimizations:
+ * 1. Per-frame CUDA streams (maximize overlap)
+ * 2. Persistent pinned buffers (zero malloc overhead)
+ * 3. Event-based dependencies (CPU doesn't wait)
+ * 4. Wavefront scheduling (maximize GPU occupancy)
+ *********************************************************************/
+
+#define MAX_BATCH_SIZE 32
+#define MAX_PYRAMID_LEVELS 8
+
+// Persistent GPU state for ULTRA mode
+typedef struct {
+    // Per-frame streams (one stream per frame for maximum parallelism)
+    cudaStream_t *frame_streams;       // [MAX_BATCH_SIZE]
+    cudaEvent_t *level_done_events;    // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    
+    // Device buffers (persistent allocation)
+    float **d_float_imgs;              // [MAX_BATCH_SIZE] raw float conversions
+    float **d_pyramid_levels;          // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    float **d_temp_smoothed;           // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    float **d_gradx;                   // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    float **d_grady;                   // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    
+    // Host pinned buffers
+    float **h_input_pinned;            // [MAX_BATCH_SIZE]
+    float **h_pyramid_pinned;          // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    float **h_gradx_pinned;            // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    float **h_grady_pinned;            // [MAX_BATCH_SIZE × MAX_PYRAMID_LEVELS]
+    
+    // Allocation tracking
+    size_t max_image_bytes;
+    int allocated_batch_size;
+    int allocated_levels;
+    bool initialized;
+} UltraState;
+
+static UltraState g_ultra = {0};
+
+
+
+
+/*********************************************************************
+ * Cleanup function
+ *********************************************************************/
+void _KLTCleanupUltraBuffers() {
+    if (!g_ultra.initialized) return;
+    
+    printf("[ULTRA] Cleaning up buffers...\n");
+    
+    // Free streams
+    for (int i = 0; i < g_ultra.allocated_batch_size; i++) {
+        cudaStreamDestroy(g_ultra.frame_streams[i]);
+    }
+    free(g_ultra.frame_streams);
+    
+    // Free events
+    int total_events = g_ultra.allocated_batch_size * g_ultra.allocated_levels;
+    for (int i = 0; i < total_events; i++) {
+        cudaEventDestroy(g_ultra.level_done_events[i]);
+    }
+    free(g_ultra.level_done_events);
+    
+    // Free device buffers
+    for (int i = 0; i < g_ultra.allocated_batch_size; i++) {
+        cudaFree(g_ultra.d_float_imgs[i]);
+    }
+    free(g_ultra.d_float_imgs);
+    
+    int total_buffers = g_ultra.allocated_batch_size * g_ultra.allocated_levels;
+    for (int i = 0; i < total_buffers; i++) {
+        cudaFree(g_ultra.d_pyramid_levels[i]);
+        cudaFree(g_ultra.d_temp_smoothed[i]);
+        cudaFree(g_ultra.d_gradx[i]);
+        cudaFree(g_ultra.d_grady[i]);
+    }
+    free(g_ultra.d_pyramid_levels);
+    free(g_ultra.d_temp_smoothed);
+    free(g_ultra.d_gradx);
+    free(g_ultra.d_grady);
+    
+    // Free pinned host buffers
+    for (int i = 0; i < g_ultra.allocated_batch_size; i++) {
+        cudaFreeHost(g_ultra.h_input_pinned[i]);
+    }
+    free(g_ultra.h_input_pinned);
+    
+    for (int i = 0; i < total_buffers; i++) {
+        cudaFreeHost(g_ultra.h_pyramid_pinned[i]);
+        cudaFreeHost(g_ultra.h_gradx_pinned[i]);
+        cudaFreeHost(g_ultra.h_grady_pinned[i]);
+    }
+    free(g_ultra.h_pyramid_pinned);
+    free(g_ultra.h_gradx_pinned);
+    free(g_ultra.h_grady_pinned);
+    
+    g_ultra.initialized = false;
+}
+
+
+
+/*********************************************************************
+ * Initialize ULTRA state (called once, reused forever)
+ *********************************************************************/
+static void ensure_ultra_buffers(int batch_size, int nLevels, int max_ncols, int max_nrows) {
+    size_t max_bytes = max_ncols * max_nrows * sizeof(float);
+    
+    if (g_ultra.initialized && 
+        batch_size <= g_ultra.allocated_batch_size &&
+        nLevels <= g_ultra.allocated_levels &&
+        max_bytes <= g_ultra.max_image_bytes) {
+        return;  // Already allocated
+    }
+    
+    // Cleanup old allocation if resizing
+    if (g_ultra.initialized) {
+        _KLTCleanupUltraBuffers();
+    }
+    
+    printf("[ULTRA] Allocating buffers for batch_size=%d, levels=%d, size=%dx%d\n",
+           batch_size, nLevels, max_ncols, max_nrows);
+    
+    // ================================================================
+    // Allocate CUDA streams (one per frame for max parallelism!)
+    // ================================================================
+    g_ultra.frame_streams = (cudaStream_t*) malloc(batch_size * sizeof(cudaStream_t));
+    for (int i = 0; i < batch_size; i++) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&g_ultra.frame_streams[i], 
+                                              cudaStreamNonBlocking));
+    }
+    
+    // ================================================================
+    // Allocate events for inter-level dependencies
+    // ================================================================
+    int total_events = batch_size * nLevels;
+    g_ultra.level_done_events = (cudaEvent_t*) malloc(total_events * sizeof(cudaEvent_t));
+    for (int i = 0; i < total_events; i++) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&g_ultra.level_done_events[i], 
+                                             cudaEventDisableTiming));
+    }
+    
+    // ================================================================
+    // Allocate device buffers (persistent!)
+    // ================================================================
+    int total_buffers = batch_size * nLevels;
+    
+    g_ultra.d_float_imgs = (float**) malloc(batch_size * sizeof(float*));
+    g_ultra.d_pyramid_levels = (float**) malloc(total_buffers * sizeof(float*));
+    g_ultra.d_temp_smoothed = (float**) malloc(total_buffers * sizeof(float*));
+    g_ultra.d_gradx = (float**) malloc(total_buffers * sizeof(float*));
+    g_ultra.d_grady = (float**) malloc(total_buffers * sizeof(float*));
+    
+    for (int i = 0; i < batch_size; i++) {
+        CUDA_CHECK(cudaMalloc(&g_ultra.d_float_imgs[i], max_bytes));
+    }
+    
+    for (int i = 0; i < total_buffers; i++) {
+        CUDA_CHECK(cudaMalloc(&g_ultra.d_pyramid_levels[i], max_bytes));
+        CUDA_CHECK(cudaMalloc(&g_ultra.d_temp_smoothed[i], max_bytes));
+        CUDA_CHECK(cudaMalloc(&g_ultra.d_gradx[i], max_bytes));
+        CUDA_CHECK(cudaMalloc(&g_ultra.d_grady[i], max_bytes));
+    }
+    
+    // ================================================================
+    // Allocate pinned host buffers (ZERO malloc overhead in hot path!)
+    // ================================================================
+    g_ultra.h_input_pinned = (float**) malloc(batch_size * sizeof(float*));
+    g_ultra.h_pyramid_pinned = (float**) malloc(total_buffers * sizeof(float*));
+    g_ultra.h_gradx_pinned = (float**) malloc(total_buffers * sizeof(float*));
+    g_ultra.h_grady_pinned = (float**) malloc(total_buffers * sizeof(float*));
+    
+    for (int i = 0; i < batch_size; i++) {
+        CUDA_CHECK(cudaMallocHost(&g_ultra.h_input_pinned[i], max_bytes));
+    }
+    
+    for (int i = 0; i < total_buffers; i++) {
+        CUDA_CHECK(cudaMallocHost(&g_ultra.h_pyramid_pinned[i], max_bytes));
+        CUDA_CHECK(cudaMallocHost(&g_ultra.h_gradx_pinned[i], max_bytes));
+        CUDA_CHECK(cudaMallocHost(&g_ultra.h_grady_pinned[i], max_bytes));
+    }
+    
+    g_ultra.max_image_bytes = max_bytes;
+    g_ultra.allocated_batch_size = batch_size;
+    g_ultra.allocated_levels = nLevels;
+    g_ultra.initialized = true;
+    
+    printf("[ULTRA] Allocated %.2f MB device memory, %.2f MB pinned host memory\n",
+           (batch_size * nLevels * 5 * max_bytes) / (1024.0 * 1024.0),
+           (batch_size * (1 + 3 * nLevels) * max_bytes) / (1024.0 * 1024.0));
+}
+
+/*********************************************************************
+ * THE ULTRA FUNCTION - Does EVERYTHING in one massive batch
+ *********************************************************************/
+void _KLTBulkBuildPyramidsWithGradientsULTRA(
+    KLT_PixelType **raw_images,        // [batch_size] input images
+    _KLT_Pyramid *pyramids_out,        // [batch_size] smoothed pyramids
+    _KLT_Pyramid *pyramids_gradx_out,  // [batch_size] gradient-X pyramids  
+    _KLT_Pyramid *pyramids_grady_out,  // [batch_size] gradient-Y pyramids
+    int batch_size,
+    KLT_TrackingContext tc)
+{
+    int ncols = pyramids_out[0]->ncols[0];
+    int nrows = pyramids_out[0]->nrows[0];
+    int nLevels = tc->nPyramidLevels;
+    int subsampling = tc->subsampling;
+    int subhalf = subsampling / 2;
+    
+    float smooth_sigma = _KLTComputeSmoothSigma(tc);
+    float pyramid_sigma = subsampling * tc->pyramid_sigma_fact;
+    float grad_sigma = tc->grad_sigma;
+    
+    // Ensure buffers are allocated
+    ensure_ultra_buffers(batch_size, nLevels, ncols, nrows);
+    
+    printf("[ULTRA] Processing batch_size=%d, nLevels=%d, image=%dx%d\n",
+           batch_size, nLevels, ncols, nrows);
+    
+    // ================================================================
+    // PHASE 0: Convert raw images to float (CPU, parallel memcpy)
+    // ================================================================
+    #pragma omp parallel for
+    for (int f = 0; f < batch_size; f++) {
+        float *h_buf = g_ultra.h_input_pinned[f];
+        KLT_PixelType *raw = raw_images[f];
+        
+        // Convert uint8 → float
+        for (int i = 0; i < ncols * nrows; i++) {
+            h_buf[i] = (float) raw[i];
+        }
+    }
+    
+    // ================================================================
+    // PHASE 1: Process BASE LEVEL (all frames in parallel)
+    // ================================================================
+    printf("[ULTRA] Phase 1: Base level smoothing (%d frames)...\n", batch_size);
+    
+    // Upload kernel once (shared across all operations)
+    ConvolutionKernel smooth_kernel, dummy;
+    _computeKernels(smooth_sigma, &smooth_kernel, &dummy);
+    
+    for (int f = 0; f < batch_size; f++) {
+        cudaStream_t stream = g_ultra.frame_streams[f];
+        size_t nbytes = ncols * nrows * sizeof(float);
+        
+        // Upload raw float image
+        CUDA_CHECK(cudaMemcpyAsync(g_ultra.d_float_imgs[f], 
+                                    g_ultra.h_input_pinned[f], nbytes,
+                                    cudaMemcpyHostToDevice, stream));
+        
+        // Separable convolution: horizontal then vertical
+        float reversed_kernel[MAX_KERNEL_SIZE];
+        for (int i = 0; i < smooth_kernel.width; i++) {
+            reversed_kernel[i] = smooth_kernel.data[smooth_kernel.width - 1 - i];
+        }
+        CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+                                            smooth_kernel.width * sizeof(float), 
+                                            0, cudaMemcpyHostToDevice, stream));
+        
+        // Launch horizontal convolution
+        dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+        dim3 grid((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+                  (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+        
+        int radius = smooth_kernel.width / 2;
+        size_t shared_bytes = BLOCK_DIM_Y * (BLOCK_DIM_X + 2 * radius + 8) * sizeof(float);
+        
+        convolveHoriz_Optimized<<<grid, block, shared_bytes, stream>>>(
+            g_ultra.d_float_imgs[f], 
+            g_ultra.d_temp_smoothed[f * nLevels + 0],  // Temp buffer
+            ncols, nrows, smooth_kernel.width);
+        
+        // Launch vertical convolution
+        int tile_vert = BLOCK_DIM_Y + 2 * radius;
+        shared_bytes = (tile_vert * (BLOCK_DIM_X + 1) + 
+                       BLOCK_DIM_X * (tile_vert + 1)) * sizeof(float);
+        
+        convolveVert_Optimized<<<grid, block, shared_bytes, stream>>>(
+            g_ultra.d_temp_smoothed[f * nLevels + 0],
+            g_ultra.d_pyramid_levels[f * nLevels + 0],  // Final smoothed base
+            ncols, nrows, smooth_kernel.width);
+        
+        // Mark base level done
+        CUDA_CHECK(cudaEventRecord(g_ultra.level_done_events[f * nLevels + 0], stream));
+    }
+    
+    // ================================================================
+    // PHASE 2: Process HIGHER LEVELS (depends on previous level)
+    // ================================================================
+    for (int level = 1; level < nLevels; level++) {
+        printf("[ULTRA] Phase 2.%d: Pyramid level %d (%d frames)...\n", 
+               level, level, batch_size);
+        
+        int prev_ncols = pyramids_out[0]->ncols[level - 1];
+        int prev_nrows = pyramids_out[0]->nrows[level - 1];
+        int curr_ncols = prev_ncols / subsampling;
+        int curr_nrows = prev_nrows / subsampling;
+        size_t prev_nbytes = prev_ncols * prev_nrows * sizeof(float);
+        
+        // Update kernel for pyramid sigma
+        _computeKernels(pyramid_sigma, &smooth_kernel, &dummy);
+        
+        for (int f = 0; f < batch_size; f++) {
+            cudaStream_t stream = g_ultra.frame_streams[f];
+            
+            // Wait for previous level to finish
+            CUDA_CHECK(cudaStreamWaitEvent(stream, 
+                                           g_ultra.level_done_events[f * nLevels + level - 1], 
+                                           0));
+            
+            // Smooth previous level
+            float reversed_kernel[MAX_KERNEL_SIZE];
+            for (int i = 0; i < smooth_kernel.width; i++) {
+                reversed_kernel[i] = smooth_kernel.data[smooth_kernel.width - 1 - i];
+            }
+            CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+                                                smooth_kernel.width * sizeof(float), 
+                                                0, cudaMemcpyHostToDevice, stream));
+            
+            dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+            dim3 grid((prev_ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+                      (prev_nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+            
+            int radius = smooth_kernel.width / 2;
+            size_t shared_bytes = BLOCK_DIM_Y * (BLOCK_DIM_X + 2 * radius + 8) * sizeof(float);
+            
+            // Horizontal pass
+            convolveHoriz_Optimized<<<grid, block, shared_bytes, stream>>>(
+                g_ultra.d_pyramid_levels[f * nLevels + level - 1],
+                g_ultra.d_temp_smoothed[f * nLevels + level],
+                prev_ncols, prev_nrows, smooth_kernel.width);
+            
+            // Vertical pass
+            int tile_vert = BLOCK_DIM_Y + 2 * radius;
+            shared_bytes = (tile_vert * (BLOCK_DIM_X + 1) + 
+                           BLOCK_DIM_X * (tile_vert + 1)) * sizeof(float);
+            
+            convolveVert_Optimized<<<grid, block, shared_bytes, stream>>>(
+                g_ultra.d_temp_smoothed[f * nLevels + level],
+                g_ultra.d_pyramid_levels[f * nLevels + level],  // Smoothed (before subsample)
+                prev_ncols, prev_nrows, smooth_kernel.width);
+            
+            // Mark level done
+            CUDA_CHECK(cudaEventRecord(g_ultra.level_done_events[f * nLevels + level], stream));
+        }
+    }
+    
+    // ================================================================
+    // PHASE 3: Compute GRADIENTS for ALL levels (maximum parallelism!)
+    // ================================================================
+    printf("[ULTRA] Phase 3: Computing gradients for %d images...\n", batch_size * nLevels);
+    
+    ConvolutionKernel gauss_kernel, gaussderiv_kernel;
+    _computeKernels(grad_sigma, &gauss_kernel, &gaussderiv_kernel);
+    
+    for (int f = 0; f < batch_size; f++) {
+        for (int level = 0; level < nLevels; level++) {
+            cudaStream_t stream = g_ultra.frame_streams[f];
+            
+            int level_ncols = pyramids_out[0]->ncols[level];
+            int level_nrows = pyramids_out[0]->nrows[level];
+            
+            // Wait for smoothing to finish
+            CUDA_CHECK(cudaStreamWaitEvent(stream, 
+                                           g_ultra.level_done_events[f * nLevels + level], 
+                                           0));
+            
+            // ========== GRADX: gaussderiv_x * gauss_y ==========
+            {
+                // Horizontal with gaussderiv
+                float reversed_kernel[MAX_KERNEL_SIZE];
+                for (int i = 0; i < gaussderiv_kernel.width; i++) {
+                    reversed_kernel[i] = gaussderiv_kernel.data[gaussderiv_kernel.width - 1 - i];
+                }
+                CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+                                                    gaussderiv_kernel.width * sizeof(float), 
+                                                    0, cudaMemcpyHostToDevice, stream));
+                
+                dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+                dim3 grid((level_ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+                          (level_nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+                
+                int radius = gaussderiv_kernel.width / 2;
+                size_t shared_bytes = BLOCK_DIM_Y * (BLOCK_DIM_X + 2 * radius + 8) * sizeof(float);
+                
+                convolveHoriz_Optimized<<<grid, block, shared_bytes, stream>>>(
+                    g_ultra.d_pyramid_levels[f * nLevels + level],
+                    g_ultra.d_temp_smoothed[f * nLevels + level],
+                    level_ncols, level_nrows, gaussderiv_kernel.width);
+                
+                // Vertical with gauss
+                for (int i = 0; i < gauss_kernel.width; i++) {
+                    reversed_kernel[i] = gauss_kernel.data[gauss_kernel.width - 1 - i];
+                }
+                CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+                                                    gauss_kernel.width * sizeof(float), 
+                                                    0, cudaMemcpyHostToDevice, stream));
+                
+                radius = gauss_kernel.width / 2;
+                int tile_vert = BLOCK_DIM_Y + 2 * radius;
+                shared_bytes = (tile_vert * (BLOCK_DIM_X + 1) + 
+                               BLOCK_DIM_X * (tile_vert + 1)) * sizeof(float);
+                
+                convolveVert_Optimized<<<grid, block, shared_bytes, stream>>>(
+                    g_ultra.d_temp_smoothed[f * nLevels + level],
+                    g_ultra.d_gradx[f * nLevels + level],
+                    level_ncols, level_nrows, gauss_kernel.width);
+            }
+            
+            // ========== GRADY: gauss_x * gaussderiv_y ==========
+            {
+                // Horizontal with gauss
+                float reversed_kernel[MAX_KERNEL_SIZE];
+                for (int i = 0; i < gauss_kernel.width; i++) {
+                    reversed_kernel[i] = gauss_kernel.data[gauss_kernel.width - 1 - i];
+                }
+                CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+                                                    gauss_kernel.width * sizeof(float), 
+                                                    0, cudaMemcpyHostToDevice, stream));
+                
+                dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+                dim3 grid((level_ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+                          (level_nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+                
+                int radius = gauss_kernel.width / 2;
+                size_t shared_bytes = BLOCK_DIM_Y * (BLOCK_DIM_X + 2 * radius + 8) * sizeof(float);
+                
+                convolveHoriz_Optimized<<<grid, block, shared_bytes, stream>>>(
+                    g_ultra.d_pyramid_levels[f * nLevels + level],
+                    g_ultra.d_temp_smoothed[f * nLevels + level],
+                    level_ncols, level_nrows, gauss_kernel.width);
+                
+                // Vertical with gaussderiv
+                for (int i = 0; i < gaussderiv_kernel.width; i++) {
+                    reversed_kernel[i] = gaussderiv_kernel.data[gaussderiv_kernel.width - 1 - i];
+                }
+                CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+                                                    gaussderiv_kernel.width * sizeof(float), 
+                                                    0, cudaMemcpyHostToDevice, stream));
+                
+                radius = gaussderiv_kernel.width / 2;
+                int tile_vert = BLOCK_DIM_Y + 2 * radius;
+                shared_bytes = (tile_vert * (BLOCK_DIM_X + 1) + 
+                               BLOCK_DIM_X * (tile_vert + 1)) * sizeof(float);
+                
+                convolveVert_Optimized<<<grid, block, shared_bytes, stream>>>(
+                    g_ultra.d_temp_smoothed[f * nLevels + level],
+                    g_ultra.d_grady[f * nLevels + level],
+                    level_ncols, level_nrows, gaussderiv_kernel.width);
+            }
+        }
+    }
+    
+    // ================================================================
+    // PHASE 4: Download results + subsample pyramids
+    // ================================================================
+    printf("[ULTRA] Phase 4: Downloading results...\n");
+    
+    for (int f = 0; f < batch_size; f++) {
+        cudaStream_t stream = g_ultra.frame_streams[f];
+        
+        for (int level = 0; level < nLevels; level++) {
+            int level_ncols = pyramids_out[0]->ncols[level];
+            int level_nrows = pyramids_out[0]->nrows[level];
+            size_t level_nbytes = level_ncols * level_nrows * sizeof(float);
+            
+            // Download pyramids and gradients to pinned buffers
+            CUDA_CHECK(cudaMemcpyAsync(g_ultra.h_pyramid_pinned[f * nLevels + level],
+                                        g_ultra.d_pyramid_levels[f * nLevels + level],
+                                        level_nbytes, cudaMemcpyDeviceToHost, stream));
+            
+            CUDA_CHECK(cudaMemcpyAsync(g_ultra.h_gradx_pinned[f * nLevels + level],
+                                        g_ultra.d_gradx[f * nLevels + level],
+                                        level_nbytes, cudaMemcpyDeviceToHost, stream));
+            
+            CUDA_CHECK(cudaMemcpyAsync(g_ultra.h_grady_pinned[f * nLevels + level],
+                                        g_ultra.d_grady[f * nLevels + level],
+                                        level_nbytes, cudaMemcpyDeviceToHost, stream));
+        }
+    }
+    
+    // Synchronize all streams
+    for (int f = 0; f < batch_size; f++) {
+        CUDA_CHECK(cudaStreamSynchronize(g_ultra.frame_streams[f]));
+    }
+    
+    // ================================================================
+    // PHASE 5: Copy to output pyramids + subsample
+    // ================================================================
+    printf("[ULTRA] Phase 5: Finalizing pyramids...\n");
+    
+    #pragma omp parallel for
+    for (int f = 0; f < batch_size; f++) {
+        for (int level = 0; level < nLevels; level++) {
+            int level_ncols = pyramids_out[f]->ncols[level];
+            int level_nrows = pyramids_out[f]->nrows[level];
+            size_t level_nbytes = level_ncols * level_nrows * sizeof(float);
+            
+            if (level == 0) {
+                // Base level: direct copy
+                memcpy(pyramids_out[f]->img[level]->data,
+                       g_ultra.h_pyramid_pinned[f * nLevels + level],
+                       level_nbytes);
+            } else {
+                // Higher levels: subsample from previous level
+                int prev_ncols = pyramids_out[f]->ncols[level - 1];
+                float *smoothed = g_ultra.h_pyramid_pinned[f * nLevels + level];
+                
+                for (int y = 0; y < level_nrows; y++) {
+                    for (int x = 0; x < level_ncols; x++) {
+                        pyramids_out[f]->img[level]->data[y * level_ncols + x] =
+                            smoothed[(subsampling * y + subhalf) * prev_ncols +
+                                     (subsampling * x + subhalf)];
+                    }
+                }
+            }
+            
+            // Copy gradients (no subsampling needed)
+            memcpy(pyramids_gradx_out[f]->img[level]->data,
+                   g_ultra.h_gradx_pinned[f * nLevels + level],
+                   level_nbytes);
+            
+            memcpy(pyramids_grady_out[f]->img[level]->data,
+                   g_ultra.h_grady_pinned[f * nLevels + level],
+                   level_nbytes);
+        }
+    }
+    
+    printf("[ULTRA] Batch complete!\n");
+}
+
