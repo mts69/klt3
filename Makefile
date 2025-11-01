@@ -30,6 +30,7 @@ FRAMES_GPU    = $(OUTPUT_GPU)/frames
 # Default values for features and frames
 N_FEATURES    = 150
 MAX_FRAMES     = 99999999
+test_count ?= 5
 
 
 ######################################################################
@@ -183,6 +184,25 @@ compare: cpu gpu
 	@echo "Comparison done — CPU and GPU outputs ready!"
 	@echo "CPU: $(OUTPUT_CPU)/video.mp4"
 	@echo "GPU: $(OUTPUT_GPU)/video.mp4"
+
+gpu-test:  lib-gpu $(OUTPUT_GPU)
+	@echo "Building GPU version..."
+	$(NVCC) -O3 $(GPUFLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(FRAMES_GPU)/"' \
+		-DMAX_FRAMES=$(MAX_FRAMES) -DN_FEATURES=$(N_FEATURES) \
+		-o main_gpu $(EXAMPLES_DIR)/main_gpu.c -L. -lklt_gpu $(LIB) -lm
+
+	@chmod +x gpu-test.sh
+	@echo "Building GPU version..."
+	@nvcc -O3 -Xcompiler "-fPIC" -Igpu/include \
+		"-gencode=arch=compute_75,code=sm_75" \
+		"-gencode=arch=compute_75,code=compute_75" \
+		-O3 -DDATA_DIR='"/content/frames/"' \
+		-DOUTPUT_DIR='"output/gpu/frames/"' \
+		-DMAX_FRAMES=99999999 -DN_FEATURES=150 \
+		-o main_gpu examples/main_gpu.c -L. -lklt_gpu -L/usr/local/lib -L/usr/lib -lm
+	@echo "Running GPU test ($${test_count} runs)..."
+	@./gpu-test.sh $${test_count}
+
 
 ######################################################################
 # Profiling CPU

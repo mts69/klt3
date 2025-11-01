@@ -108,5 +108,7 @@ int main()
   free(img1);
   free(img2);
   
+  printf("%.3f\n", cpu_time_used);
+
   return 0;
 }
